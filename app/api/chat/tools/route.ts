@@ -2,9 +2,34 @@ import { openapiToFunctions } from "@/lib/openapi-conversion"
 import { checkApiKey, getServerProfile } from "@/lib/server/server-chat-helpers"
 import { Tables } from "@/supabase/types"
 import { ChatSettings } from "@/types"
-import { OpenAIStream, StreamingTextResponse } from "ai"
 import OpenAI from "openai"
 import { ChatCompletionCreateParamsBase } from "openai/resources/chat/completions.mjs"
+
+// Helper function to safely convert to string
+function ensureString(value: string | number | boolean | object): string {
+  if (typeof value === "string") {
+    return value;
+  } else if (typeof value === "number" || typeof value === "boolean") {
+    return String(value);
+  } else if (value && typeof value === "object") {
+    return JSON.stringify(value);  // For objects, convert to JSON string
+  }
+  throw new Error("Unsupported value type for string conversion");
+}
+
+// Function to handle OpenAI's streaming response
+async function handleStream(reader: ReadableStreamDefaultReader<Uint8Array>) {
+  return new ReadableStream({
+    async pull(controller) {
+      const { done, value } = await reader.read();
+      if (done) {
+        controller.close();
+        return;
+      }
+      controller.enqueue(value);
+    },
+  });
+}
 
 export async function POST(request: Request) {
   const json = await request.json()
@@ -28,6 +53,7 @@ export async function POST(request: Request) {
     let allRouteMaps = {}
     let schemaDetails = []
 
+    // Process selected tools and generate routes
     for (const selectedTool of selectedTools) {
       try {
         const convertedSchema = await openapiToFunctions(
@@ -59,6 +85,7 @@ export async function POST(request: Request) {
       }
     }
 
+    // First API call with initial messages
     const firstResponse = await openai.chat.completions.create({
       model: chatSettings.model as ChatCompletionCreateParamsBase["model"],
       messages,
@@ -69,6 +96,7 @@ export async function POST(request: Request) {
     messages.push(message)
     const toolCalls = message.tool_calls || []
 
+    // If there are no tool calls, return the message content
     if (toolCalls.length === 0) {
       return new Response(message.content, {
         headers: {
@@ -77,11 +105,12 @@ export async function POST(request: Request) {
       })
     }
 
+    // If there are tool calls, process them
     if (toolCalls.length > 0) {
       for (const toolCall of toolCalls) {
         const functionCall = toolCall.function
         const functionName = functionCall.name
-        const argumentsString = toolCall.function.arguments.trim()
+        const argumentsString = ensureString(toolCall.function.arguments.trim())
         const parsedArgs = JSON.parse(argumentsString)
 
         // Find the schema detail that contains the function name
@@ -108,7 +137,7 @@ export async function POST(request: Request) {
               `Parameter ${paramName} not found for function ${functionName}`
             )
           }
-          return encodeURIComponent(value)
+          return encodeURIComponent(ensureString(value))
         })
 
         if (!path) {
@@ -126,8 +155,7 @@ export async function POST(request: Request) {
           }
 
           // Check if custom headers are set
-          const customHeaders = schemaDetail.headers // Moved this line up to the loop
-          // Check if custom headers are set and are of type string
+          const customHeaders = schemaDetail.headers
           if (customHeaders && typeof customHeaders === "string") {
             let parsedCustomHeaders = JSON.parse(customHeaders) as Record<
               string,
@@ -198,15 +226,33 @@ export async function POST(request: Request) {
       }
     }
 
+    // Second API call with updated messages (streaming)
     const secondResponse = await openai.chat.completions.create({
       model: chatSettings.model as ChatCompletionCreateParamsBase["model"],
       messages,
       stream: true
     })
 
-    const stream = OpenAIStream(secondResponse)
+    // Convert async iterator to ReadableStream
+    const reader = secondResponse[Symbol.asyncIterator]();
+    const stream = new ReadableStream({
+      async pull(controller) {
+        const { done, value } = await reader.next();
+        if (done) {
+          controller.close();
+        } else {
+          controller.enqueue(value);
+        }
+      }
+    });
 
-    return new StreamingTextResponse(stream)
+    // Return the stream to the client
+    return new Response(stream, {
+      headers: {
+        "Content-Type": "application/json",
+        "Transfer-Encoding": "chunked",
+      },
+    })
   } catch (error: any) {
     console.error(error)
     const errorMessage = error.error?.message || "An unexpected error occurred"

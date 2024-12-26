@@ -1,51 +1,69 @@
-import { checkApiKey, getServerProfile } from "@/lib/server/server-chat-helpers"
-import { ChatSettings } from "@/types"
-import { OpenAIStream, StreamingTextResponse } from "ai"
-import { ServerRuntime } from "next"
-import OpenAI from "openai"
-import { ChatCompletionCreateParamsBase } from "openai/resources/chat/completions.mjs"
+import { checkApiKey, getServerProfile } from "@/lib/server/server-chat-helpers";
+import { ChatSettings } from "@/types";
+import { ServerRuntime } from "next";
+import OpenAI from "openai";
+import { ChatCompletionCreateParamsBase } from "openai/resources/chat/completions.mjs";
 
-export const runtime: ServerRuntime = "edge"
+export const runtime: ServerRuntime = "edge";
 
 export async function POST(request: Request) {
-  const json = await request.json()
+  const json = await request.json();
   const { chatSettings, messages } = json as {
-    chatSettings: ChatSettings
-    messages: any[]
-  }
+    chatSettings: ChatSettings;
+    messages: any[];
+  };
 
   try {
-    const profile = await getServerProfile()
+    const profile = await getServerProfile();
 
-    checkApiKey(profile.openrouter_api_key, "OpenRouter")
+    checkApiKey(profile.openrouter_api_key, "OpenRouter");
 
     const openai = new OpenAI({
       apiKey: profile.openrouter_api_key || "",
-      baseURL: "https://openrouter.ai/api/v1"
-    })
+      baseURL: "https://openrouter.ai/api/v1",
+    });
 
     const response = await openai.chat.completions.create({
       model: chatSettings.model as ChatCompletionCreateParamsBase["model"],
       messages: messages as ChatCompletionCreateParamsBase["messages"],
       temperature: chatSettings.temperature,
       max_tokens: undefined,
-      stream: true
-    })
+      stream: true,
+    });
 
-    const stream = OpenAIStream(response)
+    const stream = new ReadableStream({
+      async start(controller) {
+        const encoder = new TextEncoder();
+        try {
+          for await (const chunk of response) {
+            const serializedChunk = JSON.stringify(chunk);
+            controller.enqueue(encoder.encode(`data: ${serializedChunk}\n\n`));
+          }
+          controller.close();
+        } catch (error) {
+          controller.error(error);
+        }
+      },
+    });
 
-    return new StreamingTextResponse(stream)
+    return new Response(stream, {
+      headers: {
+        "Content-Type": "text/event-stream",
+        "Cache-Control": "no-cache",
+        Connection: "keep-alive",
+      },
+    });
   } catch (error: any) {
-    let errorMessage = error.message || "An unexpected error occurred"
-    const errorCode = error.status || 500
+    let errorMessage = error.message || "An unexpected error occurred";
+    const errorCode = error.status || 500;
 
     if (errorMessage.toLowerCase().includes("api key not found")) {
       errorMessage =
-        "OpenRouter API Key not found. Please set it in your profile settings."
+        "OpenRouter API Key not found. Please set it in your profile settings.";
     }
 
     return new Response(JSON.stringify({ message: errorMessage }), {
-      status: errorCode
-    })
+      status: errorCode,
+    });
   }
 }
